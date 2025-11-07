@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/bin/python3
 import random
 import os
 from secret import flag
@@ -47,6 +47,8 @@ def my_unpad(message):
 def chal():
     k = os.urandom(16)
     m = json.dumps({'key':flag}).encode()
+    print(m)
+
     iv = os.urandom(16)
     cipher = AES.new(k, AES.MODE_CBC, iv)
 
@@ -54,8 +56,8 @@ def chal():
     enc = cipher.encrypt(padded)
     print(f"""
 *********************************************************
-You are put into the careless prison and trying to escape.
-Thanksfully, someone forged a key for you, but seems like it's encrypted... 
+You are put into the classical prison and trying to escape.
+Thanksfully, someone forged a key for you, but seems like it's encrypted...
 Fortunately they also leave you a copied (and apparently alive) prison door.
 The replica pairs with this encrypted key. Wait, how are this suppose to help?
 Anyway, here's your encrypted key: {(iv+enc).hex()}
@@ -68,10 +70,7 @@ Anyway, here's your encrypted key: {(iv+enc).hex()}
         iv = enc[:16]
         cipher = AES.new(k, AES.MODE_CBC, iv)
         try:
-            #print(cipher.decrypt(enc[16:]).hex())
             message = my_unpad(cipher.decrypt(enc[16:]))
-            #print(message)
-
             if message == m:
                 print("Hey you unlock me! At least you know how to use the key")
             else:

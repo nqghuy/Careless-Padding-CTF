@@ -1,123 +1,144 @@
 from pwn import *
 
-r = process(['python3', 'chal.py'])
-# context.log_level = 'DEBUG'
-r.recvuntil(b"here's your encrypted key: ")
+BLOCK_SIZE = 16
+KNOWN_PLAINTEXT = b'{"key": "hitcon{'
 
-ciphertext = bytes.fromhex(r.recvline().decode().strip())
-IV = ciphertext[0:16]
-FB = ciphertext[16:32]
-known = b'{"key": "hitcon{'
-
-db = []
-
-# to make 256 version of X
-def create_256_padding_version():
-    for i in range(256):
-        db.append(xor(IV, known, i) + FB)
-
-def get_7_bits_top(C1, C2):
-    # 2 blocks in db
-    P2 = [b''] * 16
-    cnt = 0
-    for Y in range(256):
-
-        for pos in range(16):
-            found = False
-            if P2[pos] != b'':
-                continue
-            for diff in range(0, 256, 2):
-                first_cipher_bl = [255 ^ Y] * 16  
-                first_cipher_bl[pos] = diff      
-                IV1 = bytes(first_cipher_bl)    
-                cipher = IV1 + C2 + db[Y]
-
-                if check(cipher):
-                    if diff == 0:
-                        first_cipher_bl = [255 ^ Y] * 16  
-                        first_cipher_bl[pos] = diff + 2    
-                        IV1 = bytes(first_cipher_bl)     
-                        test_cipher = IV1 + C2 + db[Y]
-                        if check(test_cipher):
-                            continue
-                    else: 
-                        found = True
-                        found_diff = diff
-                        break
-            if found:
-                P2[pos] = (C1[pos] ^ Y ^ found_diff) & 0xfe
-                print(f"Found P2[{pos}] = {P2[pos]:02x} (Y={Y}, diff={found_diff})")
-                break
-    print(P2)
-    return P2
-
-# P1 is full, P2 is partial
-def get_low_bit_in_byte14(C1, C2, top):
-    lower = [0] * 16
-    lower[14] = 0xf0
-    for i in range(0, 256, 2):
-        IV = [i] + [0] * 15
-        cipher = bytes(IV) + xor(lower, C1, top) + C2
-        if check(cipher):
-            return 0
-    return 1
-
-def get_low_bit_in_byte15(C1, C2, top):
-    pos = top[14] & 1
-    for i in range(0, 256, 2):
-        IV = [0] * 16
-        IV[pos] = i
-        cipher = bytes(IV) + xor(C1, top) + C2
-        if check(cipher):
-            return 1 - pos
-    return pos
-
-def get_bit_at_pos(C1, C2, top, pos):
-    lower = [0] * 16
-    lower[pos] = 0xf0
-    for i in range(0, 256, 2):
-        IV = [i] + [0] * 15
-        cipher = bytes(IV) + xor(lower, C1, top) + C2
-        if check(cipher):
-            return 0
-    return 1
-
-
-def get_low_bit(C1, C2, top):
-    top[14] ^= get_low_bit_in_byte14(C1, C2, top)
-    top[15] ^= get_low_bit_in_byte15(C1, C2, top)
-    for pos in range(13, -1, -1):
-        top[pos] ^= get_bit_at_pos(C1, C2, top, pos)
-
-    return top
-
-def check(cipher):
-    r.recvuntil(b'Try unlock:')
-    r.sendline(cipher.hex().encode())
+class PaddingOracle:
+    def __init__(self):
+        self.r = process(['python3', 'chal.py'])
+        self.r.recvuntil(b"here's your encrypted key: ")
+        
+        self.ciphertext = bytes.fromhex(self.r.recvline().decode().strip())
+        self.IV = self.ciphertext[0:16]
+        self.FB = self.ciphertext[16:32]
+        
+        self.padding_db = []
+        self._create_padding_database()
     
-    return not b'weirdo' in r.recvline()
+    def _create_padding_database(self):
+        for i in range(256):
+            special_iv = xor(self.IV, KNOWN_PLAINTEXT, i)
+            self.padding_db.append(special_iv + self.FB)
+    
+    def check_padding(self, cipher):
+        self.r.sendlineafter(b'Try unlock:', cipher.hex().encode())
+        return b'weirdo' not in self.r.recvline()
+    
+    def leak_7_high_bits(self, C1, C2):
+        plaintext = [None] * BLOCK_SIZE
+        
+        for Y in range(256):
+            for pos in range(BLOCK_SIZE):
+                if plaintext[pos] is not None:
+                    continue
+                
+                match_count = 0
+                found_diff = None
+                
+                for diff in range(0, 256, 2):
+                    IV1_list = [255 ^ Y] * BLOCK_SIZE
+                    IV1_list[pos] = diff
+                    cipher = bytes(IV1_list) + C2 + self.padding_db[Y]
+                    
+                    if self.check_padding(cipher):
+                        match_count += 1
+                        found_diff = diff
+                        if match_count >= 2:
+                            break
+                
+                if match_count == 1:
+                    plaintext[pos] = (C1[pos] ^ Y ^ found_diff) & 0xfe
+                    print(f"Byte {pos:2d}: 0x{plaintext[pos]:02x}")
+                    break
+        
+        return plaintext
+    
+    def leak_low_bit_byte14(self, C1, C2, high_bits):
+        diff = [0] * BLOCK_SIZE
+        diff[14] = 0xf0
+        
+        for brute in range(0, 256, 2):
+            IV1 = bytes([brute] + [0] * 15)
+            IV2 = xor(bytes(diff), C1, bytes(high_bits))
+            cipher = IV1 + IV2 + C2
+            
+            if self.check_padding(cipher):
+                return 0
+        return 1
+    
+    def leak_low_bit_byte15(self, C1, C2, high_bits):
+        pos = high_bits[14] & 1
+        
+        for brute in range(0, 256, 2):
+            IV1 = [0] * BLOCK_SIZE
+            IV1[pos] = brute
+            IV2 = xor(C1, bytes(high_bits))
+            cipher = bytes(IV1) + IV2 + C2
+            
+            if self.check_padding(cipher):
+                return 1 - pos
+        return pos
+    
+    def leak_low_bit_at_pos(self, C1, C2, high_bits, pos):
+        diff = [0] * BLOCK_SIZE
+        diff[pos] = 0xf0
+        
+        match_count = 0
+        for brute in range(0, 256, 2):
+            IV1 = bytes([brute] + [0] * 15)
+            IV2 = xor(bytes(diff), C1, bytes(high_bits))
+            cipher = IV1 + IV2 + C2
+            
+            if self.check_padding(cipher):
+                match_count += 1
+                if match_count >= 2:
+                    break
+        
+        return 0 if match_count == 1 else 1
+    
+    def leak_low_bits(self, C1, C2, high_bits):
+        plaintext = list(high_bits)
+        
+        plaintext[14] ^= self.leak_low_bit_byte14(C1, C2, plaintext)
+        plaintext[15] ^= self.leak_low_bit_byte15(C1, C2, plaintext)
+        
+        for pos in range(13, -1, -1):
+            plaintext[pos] ^= self.leak_low_bit_at_pos(C1, C2, plaintext, pos)
+        
+        return bytes(plaintext)
+    
+    def decrypt_block(self, C1, C2):
+        print(f"\n[*] Leaking 7 high bits...")
+        high_bits = self.leak_7_high_bits(C1, C2)
+        
+        print(f"[*] Leaking low bits...")
+        plaintext = self.leak_low_bits(C1, C2, high_bits)
+        
+        print(f"[+] Plaintext: {plaintext}")
+        return plaintext
+    
+    def attack(self):
+        flag = bytearray(KNOWN_PLAINTEXT)
+        
+        for i in range(32, len(self.ciphertext), BLOCK_SIZE):
+            C1 = self.ciphertext[i - 16: i]
+            C2 = self.ciphertext[i: i + 16]
+            
+            plaintext = self.decrypt_block(C1, C2)
+            flag.extend(plaintext)
+        
+        flag_str = flag.decode('utf-8', errors='ignore')
+        print(f"\n{'='*60}")
+        print(f"FLAG: {flag_str}")
+        print(f"{'='*60}")
+        real_flag = '{"key": "hitcon{p4dd1ng_w0n7_s4v3_y0u_Fr0m_4_0rac13_617aa68c06d7ab91f57d1969e8e8532}"}8888888888'
+        print(flag_str == real_flag)
+        return flag_str
 
-def attack():
-    create_256_padding_version()
-    flag = []
-    for c in known:
-        flag.append(c)
-    for i in range(32, len(ciphertext), 16):
-        IV = ciphertext[i - 32: i - 16]
-        C1 = ciphertext[i - 16: i]
-        C2 = ciphertext[i: i + 16]
-        top = get_7_bits_top(C1, C2)
-        full = get_low_bit(C1, C2, top)
-        flag += full
-        print(full)
-    flag = [chr(i) for i in flag]
-    flag = ''.join(flag)
-    print(flag)
-    print(len(flag))
-    real_flag = b'{"key": "hitcon{p4dd1ng_w0n7_s4v3_y0u_Fr0m_4_0rac13_617aa68c06d7ab91f57d1969e8e8532}"}8888888888'
-    print(flag.encode() == real_flag)
-    # for i in range(0 ,len(real_flag), 16):
-    #     print(chr(real_flag[i + 15]))
+def main():
+    oracle = PaddingOracle()
+    oracle.attack()
+    oracle.r.close()
+
 if __name__ == "__main__":
-    attack()
-
+    main()
