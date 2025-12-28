@@ -1,17 +1,17 @@
 from pwn import *
 
-BLOCK_SIZE = 16
+N = 16
 KNOWN_PLAINTEXT = b'{"key": "hitcon{'
 
 class PaddingOracle:
     def __init__(self):
         self.r = process(['python3', 'chal.py'])
         self.r.recvuntil(b"here's your encrypted key: ")
-        
-        self.ciphertext = bytes.fromhex(self.r.recvline().decode().strip())
-        self.IV = self.ciphertext[0:16]
-        self.FB = self.ciphertext[16:32]
-        
+
+        self.message = bytes.fromhex(self.r.recvline().decode().strip())
+        self.IV = self.message[0:16]
+        self.FB = self.message[16:32]
+
         self.padding_db = []
         self._create_padding_database()
     
@@ -24,37 +24,39 @@ class PaddingOracle:
         self.r.sendlineafter(b'Try unlock:', cipher.hex().encode())
         return b'weirdo' not in self.r.recvline()
     
-    def leak_7_high_bits(self, C1, C2):
-        plaintext = [None] * BLOCK_SIZE
-        
+    def leak_7_high_bits(self, _IV, C1):
+        plaintext = [None] * N
+
         for Y in range(256):
-            for pos in range(BLOCK_SIZE):
-                if plaintext[pos] is not None:
+            # i from 0 to 15
+            for i in range(N):
+                if plaintext[i] is not None:
                     continue
-                
+
                 match_count = 0
-                found_diff = None
-                
-                for diff in range(0, 256, 2):
-                    IV1_list = [255 ^ Y] * BLOCK_SIZE
-                    IV1_list[pos] = diff
-                    cipher = bytes(IV1_list) + C2 + self.padding_db[Y]
-                    
+                found_j = None
+
+                for j in range(0, 256, 2):
+                    IV1_list = [0] * N
+                    IV1_list[i] = j
+                    cipher = bytes(IV1_list) + C1 + self.padding_db[Y]
+
                     if self.check_padding(cipher):
                         match_count += 1
-                        found_diff = diff
+                        found_j = j
+                        # false positive
                         if match_count >= 2:
                             break
                 
                 if match_count == 1:
-                    plaintext[pos] = (C1[pos] ^ Y ^ found_diff) & 0xfe
-                    print(f"Byte {pos:2d}: 0x{plaintext[pos]:02x}")
+                    plaintext[i] = (_IV[i] ^ Y ^ found_j) & 0xfe # get 7 high bits
+                    print(f"Padding: {Y}   Found_j: {found_j}   IV'[{i}]: {_IV[i]}   Byte {i:2d}: 0x{plaintext[i]:02x}")
                     break
-        
+
         return plaintext
-    
+        
     def leak_low_bit_byte14(self, C1, C2, high_bits):
-        diff = [0] * BLOCK_SIZE
+        diff = [0] * N
         diff[14] = 0xf0
         
         for brute in range(0, 256, 2):
@@ -66,29 +68,29 @@ class PaddingOracle:
                 return 0
         return 1
     
-    def leak_low_bit_byte15(self, C1, C2, high_bits):
+    def leak_low_bit_byte15(self, _IV, C1, high_bits):
         pos = high_bits[14] & 1
-        
-        for brute in range(0, 256, 2):
-            IV1 = [0] * BLOCK_SIZE
-            IV1[pos] = brute
-            IV2 = xor(C1, bytes(high_bits))
-            cipher = bytes(IV1) + IV2 + C2
-            
+
+        for j in range(0, 256, 2):
+            IV1 = [0] * N
+            IV1[pos] = j
+            IV2 = xor(_IV, bytes(high_bits))
+            cipher = bytes(IV1) + IV2 + C1
+
             if self.check_padding(cipher):
                 return 1 - pos
         return pos
     
-    def leak_low_bit_at_pos(self, C1, C2, high_bits, pos):
-        diff = [0] * BLOCK_SIZE
-        diff[pos] = 0xf0
-        
+    def leak_low_bit_at_pos(self, _IV, C1, plaintext, pos):
+        block = [0] * N
+        block[pos] = 0xf0
+
         match_count = 0
-        for brute in range(0, 256, 2):
-            IV1 = bytes([brute] + [0] * 15)
-            IV2 = xor(bytes(diff), C1, bytes(high_bits))
-            cipher = IV1 + IV2 + C2
-            
+        for j in range(0, 256, 2):
+            IV1 = bytes([j] + [0] * 15)
+            IV2 = xor(bytes(block), _IV, bytes(plaintext))
+            cipher = IV1 + IV2 + C1
+
             if self.check_padding(cipher):
                 match_count += 1
                 if match_count >= 2:
@@ -107,28 +109,29 @@ class PaddingOracle:
         
         return bytes(plaintext)
     
-    def decrypt_block(self, C1, C2):
+    def decrypt_block(self, _IV, C1):
         print(f"\n[*] Leaking 7 high bits...")
-        high_bits = self.leak_7_high_bits(C1, C2)
-        
+        high_bits = self.leak_7_high_bits(_IV, C1)
+
         print(f"[*] Leaking low bits...")
-        plaintext = self.leak_low_bits(C1, C2, high_bits)
-        
+        # Lưu ý: Hàm leak_low_bits này cần bạn tự định nghĩa để gọi các hàm leak_low_bit_... ở trên
+        plaintext = self.leak_low_bits(_IV, C1, high_bits) 
+
         print(f"[+] Plaintext: {plaintext}")
         return plaintext
-    
+
     def attack(self):
         flag = bytearray(KNOWN_PLAINTEXT)
-        
-        for i in range(32, len(self.ciphertext), BLOCK_SIZE):
-            C1 = self.ciphertext[i - 16: i]
-            C2 = self.ciphertext[i: i + 16]
-            
-            plaintext = self.decrypt_block(C1, C2)
+
+        for i in range(32, len(self.message), N):
+            _IV = self.message[i - 16: i]
+            C1 = self.message[i: i + 16]
+
+            plaintext = self.decrypt_block(_IV, C1)
             flag.extend(plaintext)
-        
+
         flag_str = flag.decode('utf-8', errors='ignore')
-        print(f"\n{'='*60}")
+        print(f"{'='*60}")
         print(f"FLAG: {flag_str}")
         print(f"{'='*60}")
         real_flag = '{"key": "hitcon{p4dd1ng_w0n7_s4v3_y0u_Fr0m_4_0rac13_617aa68c06d7ab91f57d1969e8e8532}"}8888888888'
